@@ -1,0 +1,18 @@
+# Clave de API — nunca subir al repositorio
+.env
+
+# ChromaDB se regenera automáticamente al iniciar la app
+vectorstore/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Sistema
+.DS_Store
+Thumbs.db
