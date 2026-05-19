@@ -1,78 +1,65 @@
 """
-ingest.py — Pipeline de ingestión de documentos para el Agente Ganadero.
+ingest.py — Pipeline de ingestión sin ChromaDB.
 
-Flujo:
-  1. Lee archivos de data/ (PDF, TXT, CSV)
-  2. Divide el texto en chunks con solapamiento
-  3. Genera embeddings multilingües con sentence-transformers
-  4. Persiste todo en ChromaDB (vectorstore/)
+Guarda los embeddings como:
+  vectorstore/embeddings.npy  → matriz float32 (N_chunks × dim)
+  vectorstore/metadata.json   → lista de {texto, fuente, tipo}
 
 Uso:
-  python ingest.py            # ingestión incremental (upsert)
-  python ingest.py --limpiar  # borra la colección y reinicia
+  python ingest.py
+  python ingest.py --limpiar
 """
 
 import argparse
+import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pypdf
-import chromadb
 from sentence_transformers import SentenceTransformer
 
-# ── Configuración ──────────────────────────────────────────────────────────────
-DATA_DIR       = Path("data")
+DATA_DIR        = Path("data")
 VECTORSTORE_DIR = Path("vectorstore")
-COLLECTION_NAME = "ganadero_kb"
+EMBEDDINGS_FILE = VECTORSTORE_DIR / "embeddings.npy"
+METADATA_FILE   = VECTORSTORE_DIR / "metadata.json"
 
-# Modelo multilingüe: soporta español sin necesidad de traducción
-EMBED_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
-
-# Tamaño del chunk en palabras y solapamiento entre chunks consecutivos
+EMBED_MODEL   = "paraphrase-multilingual-MiniLM-L12-v2"
 CHUNK_SIZE    = 350
 CHUNK_OVERLAP = 60
 
 
-# ── Funciones de lectura ───────────────────────────────────────────────────────
+# ── Lectores ───────────────────────────────────────────────────────────────────
 
 def _leer_pdf(ruta: Path) -> str:
-    """Extrae el texto completo de un PDF página a página."""
-    texto = []
+    partes = []
     with open(ruta, "rb") as f:
-        lector = pypdf.PdfReader(f)
-        for num, pagina in enumerate(lector.pages, 1):
-            contenido = pagina.extract_text() or ""
-            if contenido.strip():
-                texto.append(f"--- Página {num} ---\n{contenido}")
-    return "\n".join(texto)
+        for num, pag in enumerate(pypdf.PdfReader(f).pages, 1):
+            txt = pag.extract_text() or ""
+            if txt.strip():
+                partes.append(f"--- Página {num} ---\n{txt}")
+    return "\n".join(partes)
 
 
 def _leer_txt(ruta: Path) -> str:
-    """Lee un TXT probando distintas codificaciones comunes en Colombia."""
     for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
         try:
             return ruta.read_text(encoding=enc)
         except (UnicodeDecodeError, LookupError):
             continue
-    raise ValueError(f"No se pudo decodificar {ruta.name} con ninguna codificación estándar.")
+    raise ValueError(f"No se pudo leer {ruta.name}")
 
 
 def _leer_csv(ruta: Path) -> str:
-    """
-    Convierte un CSV en texto narrativo para RAG.
-    Cada fila se transforma en una oración 'columna: valor. columna: valor.'
-    para que el retriever pueda encontrarla con preguntas en lenguaje natural.
-    """
     df = None
     for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
         try:
             df = pd.read_csv(ruta, encoding=enc)
             break
-        except (UnicodeDecodeError, pd.errors.ParserError):
+        except Exception:
             continue
-
     if df is None:
-        raise ValueError(f"No se pudo leer el CSV {ruta.name}.")
+        raise ValueError(f"No se pudo parsear {ruta.name}")
 
     lineas = [f"Fuente: {ruta.name} — {len(df)} registros\n"]
     for _, fila in df.iterrows():
@@ -83,71 +70,57 @@ def _leer_csv(ruta: Path) -> str:
         ]
         if partes:
             lineas.append(". ".join(partes) + ".")
-
     return "\n".join(lineas)
 
 
-# ── Chunking ──────────────────────────────────────────────────────────────────
+# ── Chunking ───────────────────────────────────────────────────────────────────
 
-def _dividir_chunks(texto: str, tamano: int = CHUNK_SIZE, solapamiento: int = CHUNK_OVERLAP) -> list[str]:
-    """
-    Divide texto en ventanas de 'tamano' palabras con 'solapamiento' palabras
-    compartidas entre chunks adyacentes, para no perder contexto en los bordes.
-    """
+def _dividir_chunks(texto: str) -> list[str]:
     palabras = texto.split()
     chunks, inicio = [], 0
-    paso = max(1, tamano - solapamiento)
-
+    paso = max(1, CHUNK_SIZE - CHUNK_OVERLAP)
     while inicio < len(palabras):
-        fin = min(inicio + tamano, len(palabras))
+        fin   = min(inicio + CHUNK_SIZE, len(palabras))
         chunk = " ".join(palabras[inicio:fin]).strip()
         if chunk:
             chunks.append(chunk)
         inicio += paso
-
     return chunks
 
 
 # ── Pipeline principal ─────────────────────────────────────────────────────────
 
 def ingestar(limpiar: bool = False) -> None:
-    """
-    Procesa todos los documentos de data/ y los indexa en ChromaDB.
+    VECTORSTORE_DIR.mkdir(exist_ok=True)
 
-    Args:
-        limpiar: Si True, elimina la colección existente antes de comenzar.
-    """
-    # Inicializar ChromaDB con persistencia en disco
-    cliente = chromadb.PersistentClient(path=str(VECTORSTORE_DIR))
+    # Cargar embeddings existentes (para modo incremental)
+    todos_embeddings: list[list[float]] = []
+    todos_meta: list[dict] = []
 
-    if limpiar:
-        try:
-            cliente.delete_collection(COLLECTION_NAME)
-            print("Colección anterior eliminada.")
-        except Exception:
-            pass
+    if not limpiar and EMBEDDINGS_FILE.exists() and METADATA_FILE.exists():
+        todos_embeddings = np.load(str(EMBEDDINGS_FILE)).tolist()
+        todos_meta = json.loads(METADATA_FILE.read_text(encoding="utf-8"))
+        fuentes_ya = {m["fuente"] for m in todos_meta}
+        print(f"Modo incremental: {len(todos_meta)} chunks ya indexados.")
+    else:
+        fuentes_ya = set()
 
-    # Cargar modelo de embeddings (se descarga automáticamente la primera vez ~120 MB)
-    print(f"Cargando modelo de embeddings: {EMBED_MODEL} ...")
+    print(f"Cargando modelo: {EMBED_MODEL} ...")
     modelo = SentenceTransformer(EMBED_MODEL)
 
-    coleccion = cliente.get_or_create_collection(
-        name=COLLECTION_NAME,
-        metadata={"hnsw:space": "cosine"},  # similitud coseno para textos
-    )
-
-    # Recorrer todos los archivos en data/
     archivos = sorted(p for p in DATA_DIR.iterdir() if p.is_file())
     if not archivos:
-        print("No hay archivos en data/. Agrega documentos y vuelve a ejecutar.")
+        print("No hay archivos en data/.")
         return
 
-    total_chunks = 0
-
+    nuevos = 0
     for ruta in archivos:
+        if ruta.name in fuentes_ya:
+            print(f"Omitido (ya indexado): {ruta.name}")
+            continue
+
         ext = ruta.suffix.lower()
         print(f"\nProcesando: {ruta.name}")
-
         try:
             if ext == ".pdf":
                 texto = _leer_pdf(ruta)
@@ -156,39 +129,40 @@ def ingestar(limpiar: bool = False) -> None:
             elif ext == ".csv":
                 texto = _leer_csv(ruta)
             else:
-                print(f"  Formato '{ext}' no soportado — omitido.")
+                print(f"  Formato '{ext}' no soportado.")
                 continue
         except Exception as exc:
-            print(f"  Error leyendo {ruta.name}: {exc}")
+            print(f"  Error: {exc}")
             continue
 
         if not texto.strip():
-            print(f"  Archivo vacío — omitido.")
             continue
 
         chunks = _dividir_chunks(texto)
-        print(f"  {len(chunks)} chunks generados.")
+        print(f"  {len(chunks)} chunks.")
 
-        # Insertar en lotes para no sobrecargar la memoria
+        # Generar embeddings en lotes
         LOTE = 64
         for i in range(0, len(chunks), LOTE):
-            lote = chunks[i : i + LOTE]
-            embeddings = modelo.encode(lote, show_progress_bar=False).tolist()
-            ids = [f"{ruta.stem}__{i + j}" for j in range(len(lote))]
-            metadatos = [{"fuente": ruta.name, "tipo": ext} for _ in lote]
+            lote = chunks[i: i + LOTE]
+            embs = modelo.encode(lote, show_progress_bar=False).tolist()
+            todos_embeddings.extend(embs)
+            todos_meta.extend({"texto": c, "fuente": ruta.name, "tipo": ext} for c in lote)
 
-            # upsert: actualiza si el ID ya existe, inserta si no
-            coleccion.upsert(documents=lote, embeddings=embeddings, ids=ids, metadatas=metadatos)
+        nuevos += len(chunks)
 
-        total_chunks += len(chunks)
+    if nuevos == 0 and todos_embeddings:
+        print("Nada nuevo que indexar.")
+        return
 
-    print(f"\n✓ Ingestión completa — {total_chunks} chunks almacenados en '{COLLECTION_NAME}'.")
+    # Persistir
+    np.save(str(EMBEDDINGS_FILE), np.array(todos_embeddings, dtype=np.float32))
+    METADATA_FILE.write_text(json.dumps(todos_meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\n✓ Indexados {len(todos_meta)} chunks totales → vectorstore/")
 
-
-# ── Ejecución directa ──────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Ingestión de documentos para el Agente Ganadero")
-    parser.add_argument("--limpiar", action="store_true", help="Borrar colección existente antes de ingestar")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--limpiar", action="store_true")
     args = parser.parse_args()
     ingestar(limpiar=args.limpiar)

@@ -19,24 +19,12 @@ st.set_page_config(
 @st.cache_resource(show_spinner="Cargando modelos e indexando documentos...")
 def _cargar_agente():
     """
-    Instancia el agente. Si el vectorstore no existe (primer despliegue),
-    ejecuta la ingestión automáticamente antes de crear el agente.
+    Instancia el agente. Si el vectorstore no existe (primer despliegue en nube),
+    ejecuta la ingestión automáticamente.
     """
-    from pathlib import Path
-    from ingest import ingestar, VECTORSTORE_DIR, COLLECTION_NAME
-    import chromadb
+    from ingest import ingestar, EMBEDDINGS_FILE
 
-    # Verificar si la colección ya existe en disco
-    coleccion_lista = False
-    if VECTORSTORE_DIR.exists():
-        try:
-            cliente = chromadb.PersistentClient(path=str(VECTORSTORE_DIR))
-            nombres = [c.name for c in cliente.list_collections()]
-            coleccion_lista = COLLECTION_NAME in nombres
-        except Exception:
-            coleccion_lista = False
-
-    if not coleccion_lista:
+    if not EMBEDDINGS_FILE.exists():
         ingestar(limpiar=True)
 
     from agent import AgenteGanadero

@@ -1,92 +1,70 @@
 """
-rag.py — Módulo de Recuperación Aumentada (RAG).
+rag.py — Búsqueda semántica sobre numpy (sin ChromaDB).
 
-Responsabilidades:
-  - Conectarse a la colección ChromaDB ya indexada
-  - Codificar la consulta del usuario con el mismo modelo de embeddings
-  - Recuperar los k chunks más similares por distancia coseno
-  - Devolver el contexto formateado listo para inyectar en el prompt del LLM
+Carga embeddings.npy + metadata.json y calcula similitud coseno
+para recuperar los k fragmentos más relevantes a una consulta.
 """
 
-import chromadb
+import json
+from pathlib import Path
+
+import numpy as np
 from sentence_transformers import SentenceTransformer
 
-from ingest import VECTORSTORE_DIR, COLLECTION_NAME, EMBED_MODEL
+from ingest import VECTORSTORE_DIR, EMBEDDINGS_FILE, METADATA_FILE, EMBED_MODEL
 
-# Número de fragmentos a recuperar por consulta
 TOP_K_DEFAULT = 5
 
 
 class RecuperadorRAG:
-    """Encapsula toda la lógica de búsqueda semántica sobre ChromaDB."""
 
     def __init__(self, top_k: int = TOP_K_DEFAULT):
         self.top_k = top_k
 
-        # Conectar a la base vectorial persistente
-        self._cliente = chromadb.PersistentClient(path=str(VECTORSTORE_DIR))
-        self._modelo   = SentenceTransformer(EMBED_MODEL)
-
-        # Verificar que la colección exista
-        colecciones = [c.name for c in self._cliente.list_collections()]
-        if COLLECTION_NAME not in colecciones:
+        if not EMBEDDINGS_FILE.exists() or not METADATA_FILE.exists():
             raise RuntimeError(
-                f"La colección '{COLLECTION_NAME}' no existe. "
-                "Ejecuta primero: python ingest.py"
+                "Vectorstore no encontrado. Ejecuta primero: python ingest.py"
             )
 
-        self._coleccion = self._cliente.get_collection(COLLECTION_NAME)
+        self._modelo    = SentenceTransformer(EMBED_MODEL)
+        self._embeddings = np.load(str(EMBEDDINGS_FILE))          # (N, dim) float32
+        self._meta       = json.loads(METADATA_FILE.read_text(encoding="utf-8"))
+
+        # Pre-normalizar para que la similitud coseno sea solo un producto punto
+        norms = np.linalg.norm(self._embeddings, axis=1, keepdims=True)
+        norms[norms == 0] = 1e-9
+        self._embeddings_norm = self._embeddings / norms
 
     # ── API pública ────────────────────────────────────────────────────────────
 
     def recuperar(self, consulta: str, k: int | None = None) -> list[dict]:
-        """
-        Devuelve los k chunks más relevantes para la consulta.
-
-        Returns:
-            Lista de dicts con claves: 'texto', 'fuente', 'distancia'
-        """
         k = k or self.top_k
-        embedding = self._modelo.encode([consulta]).tolist()
+        q = self._modelo.encode([consulta])[0].astype(np.float32)
+        q /= max(np.linalg.norm(q), 1e-9)
 
-        resultados = self._coleccion.query(
-            query_embeddings=embedding,
-            n_results=k,
-            include=["documents", "metadatas", "distances"],
-        )
+        similitudes = self._embeddings_norm @ q          # producto punto = coseno
+        indices     = np.argsort(similitudes)[::-1][:k]  # top-k descendente
 
-        chunks = []
-        for doc, meta, dist in zip(
-            resultados["documents"][0],
-            resultados["metadatas"][0],
-            resultados["distances"][0],
-        ):
-            chunks.append({
-                "texto":     doc,
-                "fuente":    meta.get("fuente", "desconocida"),
-                "distancia": round(float(dist), 4),
-            })
-
-        return chunks
+        return [
+            {
+                "texto":      self._meta[i]["texto"],
+                "fuente":     self._meta[i]["fuente"],
+                "similitud":  round(float(similitudes[i]), 4),
+            }
+            for i in indices
+        ]
 
     def construir_contexto(self, consulta: str, k: int | None = None) -> tuple[str, list[str]]:
-        """
-        Recupera chunks y los formatea como bloque de contexto para el LLM.
-
-        Returns:
-            (contexto_str, fuentes_únicas_ordenadas)
-        """
         chunks = self.recuperar(consulta, k)
 
         if not chunks:
-            return "No se encontró información relevante en la base de conocimiento.", []
+            return "No se encontró información relevante.", []
 
         bloques, fuentes = [], []
         for i, c in enumerate(chunks, 1):
-            bloques.append(f"[Fragmento {i} | Fuente: {c['fuente']} | Relevancia: {1 - c['distancia']:.2%}]\n{c['texto']}")
+            bloques.append(
+                f"[Fragmento {i} | Fuente: {c['fuente']} | Relevancia: {c['similitud']:.2%}]\n{c['texto']}"
+            )
             fuentes.append(c["fuente"])
 
-        # Deduplicar fuentes manteniendo el orden de aparición
-        fuentes_unicas = list(dict.fromkeys(fuentes))
-
-        return "\n\n".join(bloques), fuentes_unicas
+        return "\n\n".join(bloques), list(dict.fromkeys(fuentes))
