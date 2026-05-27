@@ -29,7 +29,7 @@ load_dotenv()
 # ── Constantes ─────────────────────────────────────────────────────────────────
 MODELO_GROQ    = "llama-3.3-70b-versatile"
 MAX_ITERACIONES = 6   # ciclos herramienta máximos antes de forzar respuesta
-HISTORIAL_TURNOS = 4  # turnos (usuario+asistente) que se conservan en contexto
+HISTORIAL_TURNOS = 2  # turnos (usuario+asistente) que se conservan en contexto
 
 # ── Prompt del sistema ─────────────────────────────────────────────────────────
 # El contexto RAG se inyecta dinámicamente antes de cada llamada al LLM.

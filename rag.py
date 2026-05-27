@@ -13,7 +13,7 @@ from sentence_transformers import SentenceTransformer
 
 from ingest import VECTORSTORE_DIR, EMBEDDINGS_FILE, METADATA_FILE, EMBED_MODEL
 
-TOP_K_DEFAULT = 5
+TOP_K_DEFAULT = 3
 
 
 class RecuperadorRAG:
